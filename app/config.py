@@ -61,4 +61,4 @@ except Exception as e:
     print("- BLOCKED_DOMAINS (comma-separated list)")
     print("- MAX_REQUESTS_PER_MINUTE (default: 30)")
     print("- MAX_EMAIL_SIZE (default: 1048576 bytes)")
-    sys.exit(1) 
+    sys.exit(1)
