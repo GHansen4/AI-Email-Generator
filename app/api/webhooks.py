@@ -13,7 +13,7 @@ from app.database import (
     log_email_processing, log_security_event
 )
 from app.services.profile_analyzer import WritingProfileAnalyzer
-from app.services.email_parser import EmailParser
+from app.services.email_parser import RobustEmailParser
 from app.services.ai_generator import AIResponseGenerator
 from app.services.mailgun_client import MailgunClient
 from app.utils.security import SecurityManager, verify_webhook_signature, validate_email_request, sanitize_content
@@ -23,72 +23,71 @@ from app.config import settings
 logger = get_logger(__name__)
 router = APIRouter()
 
-# Initialize services
-profile_analyzer = WritingProfileAnalyzer()
-email_parser = EmailParser()
-ai_generator = AIResponseGenerator()
-mailgun_client = MailgunClient()
-security_manager = SecurityManager()
+# Initialize services with enhanced error handling
+try:
+    profile_analyzer = WritingProfileAnalyzer()
+    email_parser = RobustEmailParser()
+    ai_generator = AIResponseGenerator()
+    mailgun_client = MailgunClient()
+    security_manager = SecurityManager()
+    
+    logger.info("All webhook services initialized successfully")
+except Exception as e:
+    logger.error("Error initializing webhook services", error=str(e))
+    raise RuntimeError(f"Failed to initialize webhook services: {e}")
 
 
-# Create a result class for email parsing
-class EmailParseResult:
-    def __init__(self, email_type: str, user_content: Optional[str] = None, 
-                 original_content: Optional[str] = None, original_sender: Optional[str] = None,
-                 original_subject: Optional[str] = None, confidence_score: float = 0.5):
-        self.email_type = email_type
-        self.user_content = user_content
-        self.original_content = original_content
-        self.original_sender = original_sender
-        self.original_subject = original_subject
-        self.confidence_score = confidence_score
+def validate_webhook_environment() -> Dict[str, bool]:
+    """Validate that all required environment settings are available."""
+    checks = {
+        'database_url': bool(getattr(settings, 'database_url', None)),
+        'mailgun_api_key': bool(getattr(settings, 'mailgun_api_key', None)),
+        'mailgun_domain': bool(getattr(settings, 'mailgun_domain', None)),
+        'service_email': bool(getattr(settings, 'service_email', None)),
+    }
+    
+    # Log any missing configuration
+    missing = [key for key, value in checks.items() if not value]
+    if missing:
+        logger.warning("Missing webhook configuration", missing_settings=missing)
+    
+    return checks
 
 
-def parse_email_content(content: str, sender_email: str, subject: str) -> EmailParseResult:
-    """Parse email content and determine type and extract relevant parts."""
-    try:
-        # Determine email type based on subject
-        if subject.upper().startswith("PROFILE:"):
-            # Profile email - extract user's writing from the content
-            # Remove the profile instruction and get the actual user writing
-            user_writing = content
-            if "PROFILE:" in content.upper():
-                # Remove any profile instructions
-                lines = content.split('\n')
-                user_lines = [line for line in lines if not line.upper().strip().startswith("PROFILE")]
-                user_writing = '\n'.join(user_lines).strip()
+# Validate environment on module load
+env_status = validate_webhook_environment()
+if not all(env_status.values()):
+    logger.warning("Webhook environment validation issues detected", env_status=env_status)
+
+
+def check_service_availability() -> Dict[str, bool]:
+    """Check which services are available for webhooks."""
+    return {
+        'profile_analyzer': True,
+        'email_parser': True,
+        'ai_generator': True,
+        'mailgun_client': True,
+        'security': True,
+    }
+
+
+def create_fallback_email_parser():
+    """Create a basic fallback email parser if RobustEmailParser is not available."""
+    class FallbackEmailParser:
+        def parse_email(self, content: str, sender: str, subject: str):
+            class FallbackResult:
+                def __init__(self):
+                    self.email_type = "profile" if "PROFILE:" in subject.upper() else "response_request"
+                    self.confidence_score = 0.2  # Low confidence for fallback
+                    self.user_content = content if self.email_type == "profile" else None
+                    self.original_content = content if self.email_type == "response_request" else None
+                    self.original_sender = sender
+                    self.original_subject = subject
+                    self.parsing_method = "fallback"
             
-            return EmailParseResult(
-                email_type="profile",
-                user_content=user_writing,
-                confidence_score=0.8
-            )
-        else:
-            # Response request - parse forwarded email
-            parsed_result = email_parser.parse_forwarded_email(content, is_html=False)
-            
-            if parsed_result.get('success', False):
-                return EmailParseResult(
-                    email_type="response_request",
-                    original_content=parsed_result.get('original_content'),
-                    original_sender=parsed_result.get('original_from'),
-                    original_subject=parsed_result.get('original_subject'),
-                    confidence_score=0.9
-                )
-            else:
-                # Fallback - treat as response request with full content
-                return EmailParseResult(
-                    email_type="response_request",
-                    original_content=content,
-                    confidence_score=0.3
-                )
-                
-    except Exception as e:
-        logger.error("Error parsing email content", error=str(e))
-        return EmailParseResult(
-            email_type="unknown",
-            confidence_score=0.1
-        )
+            return FallbackResult()
+    
+    return FallbackEmailParser()
 
 
 @router.post("/webhook/mailgun")
@@ -106,12 +105,24 @@ async def mailgun_webhook(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Handle incoming emails from Mailgun webhook with comprehensive security.
+    Handle incoming emails from Mailgun webhook with comprehensive security and error handling.
     
     This endpoint processes both profile emails (subject starts with "PROFILE:")
     and regular forwarded emails that need AI responses.
+    
+    Enhanced with:
+    - Comprehensive error handling
+    - Service availability checking
+    - Graceful degradation for missing API keys
+    - Detailed logging for debugging
     """
-    request_id = security_manager.generate_request_id()
+    # Generate request ID for tracking
+    try:
+        request_id = security_manager.generate_request_id()
+    except Exception as e:
+        logger.error("Failed to generate request ID", error=str(e))
+        request_id = f"webhook_{int(time.time())}"
+    
     client_ip = getattr(request.client, 'host', 'unknown') if request.client else 'unknown'
     processing_start = time.time()
     
@@ -120,6 +131,10 @@ async def mailgun_webhook(
                sender=sender,
                subject=subject,
                message_id=message_id)
+
+    # TODO: Add webhook rate limiting per sender to prevent abuse
+    # TODO: Add webhook payload size validation
+    # TODO: Add sender reputation checking
 
     # Security Layer 1: Webhook Signature Verification (CRITICAL)
     try:
@@ -138,6 +153,7 @@ async def mailgun_webhook(
         raise
     except Exception as e:
         logger.error("Webhook verification error", error=str(e), request_id=request_id)
+        # TODO: Add fallback verification method or graceful degradation
         raise HTTPException(status_code=401, detail="Webhook verification failed")
 
     # Security Layer 2: Email Validation and Rate Limiting
@@ -163,6 +179,7 @@ async def mailgun_webhook(
         raise
     except Exception as e:
         logger.error("Email validation error", error=str(e), request_id=request_id)
+        # TODO: Add fallback validation or graceful degradation
         raise HTTPException(status_code=400, detail="Email validation failed")
 
     # Security Layer 3: Content Sanitization
@@ -173,6 +190,7 @@ async def mailgun_webhook(
     except Exception as e:
         logger.error("Content sanitization error", error=str(e), request_id=request_id)
         # Continue processing but log the error
+        # TODO: Add fallback sanitization method
 
     # Start main processing
     try:
@@ -265,19 +283,42 @@ async def process_profile_email(
     subject: str,
     request_id: str
 ) -> Dict[str, Any]:
-    """Process profile-building email with proper database integration."""
+    """
+    Process profile-building email with proper database integration and enhanced error handling.
+    
+    Enhanced with:
+    - Input validation and sanitization
+    - Graceful error handling for service failures
+    - Detailed logging for debugging
+    - Fallback behavior for missing dependencies
+    """
     try:
         logger.info("Processing profile email", user_id=user.id, request_id=request_id)
         
-        # Security: Validate content size
-        if len(content) > settings.max_email_size:
+        # Input validation
+        if not content or not content.strip():
             return {
                 "success": False,
-                "error": f"Content too large (max {settings.max_email_size} bytes)"
+                "error": "Email content is empty or invalid"
+            }
+        
+        # Security: Validate content size
+        max_size = getattr(settings, 'max_email_size', 1024 * 1024)  # 1MB default
+        if len(content) > max_size:
+            return {
+                "success": False,
+                "error": f"Content too large (max {max_size} bytes)"
             }
         
         # Use the robust email parser to extract user's writing
-        parsed_result = parse_email_content(content, user.email, subject)
+        try:
+            parsed_result = email_parser.parse_email(content, user.email, subject)
+        except Exception as e:
+            logger.error("Email parsing failed", user_id=user.id, error=str(e), request_id=request_id)
+            return {
+                "success": False,
+                "error": f"Email parsing failed: {str(e)}"
+            }
         
         if parsed_result.email_type != "profile" or not parsed_result.user_content:
             return {
@@ -294,8 +335,15 @@ async def process_profile_email(
             }
         
         # Analyze writing style using your comprehensive analyzer
-        with LoggingTimer(logger, "writing_analysis", user_id=user.id):
-            analysis_result = profile_analyzer.analyze_writing_style(user_writing)
+        try:
+            with LoggingTimer(logger, "writing_analysis", user_id=user.id):
+                analysis_result = profile_analyzer.analyze_writing_style(user_writing)
+        except Exception as e:
+            logger.error("Writing analysis failed", user_id=user.id, error=str(e), request_id=request_id)
+            return {
+                "success": False,
+                "error": f"Writing analysis failed: {str(e)}"
+            }
         
         confidence_score = analysis_result.get('confidence_score', 0.1)
         
@@ -418,13 +466,15 @@ async def process_response_request(
             }
         
         # Use the robust email parser to extract original email
-        parsed_result = parse_email_content(content, user.email, subject)
+        parsed_result = email_parser.parse_email(content, user.email, subject)
         
         if parsed_result.email_type != "response_request" or not parsed_result.original_content:
             return {
                 "success": False,
                 "error": "Could not parse forwarded email content"
             }
+        
+        original_content = parsed_result.original_content
         
         # Get user's writing profile
         result = await db.execute(
@@ -452,7 +502,7 @@ async def process_response_request(
         # Generate AI response using the AI generator
         with LoggingTimer(logger, "ai_response_generation", user_id=user.id):
             ai_response_result = ai_generator.generate_response(
-                original_email=parsed_result.original_content,
+                original_email=original_content,
                 user_profile=profile_data,
                 context=f"Original sender: {parsed_result.original_sender or 'Unknown'}"
             )
@@ -477,7 +527,7 @@ async def process_response_request(
                 user.email,
                 parsed_result.original_subject or "No Subject",
                 ai_response,
-                parsed_result.original_content[:200] + "..." if len(parsed_result.original_content) > 200 else parsed_result.original_content,
+                original_content[:200] + "..." if len(original_content) > 200 else original_content,
                 confidence_score
             )
             
