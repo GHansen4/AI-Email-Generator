@@ -33,6 +33,7 @@ A sophisticated AI-powered email response system that analyzes users' writing st
 - **AIResponseGenerator**: Claude-powered response generation with style matching
 - **EmailParser**: Intelligent parsing of forwarded emails and profile content
 - **MailgunClient**: Email delivery and webhook handling
+- **SecurityManager**: Comprehensive security and threat protection
 - **Database Models**: User profiles, email logs, and writing patterns
 
 ### Technology Stack
@@ -41,8 +42,10 @@ A sophisticated AI-powered email response system that analyzes users' writing st
 - **AI**: Anthropic Claude API
 - **Email**: Mailgun API
 - **Database**: SQLAlchemy (PostgreSQL/SQLite)
+- **Security**: Cryptography, HMAC verification, rate limiting
 - **NLP**: NLTK, spaCy (optional), textstat (optional)
-- **Security**: Webhook signature verification
+- **Testing**: pytest
+- **Logging**: structlog with comprehensive security monitoring
 
 ## 📦 Installation
 
@@ -57,7 +60,7 @@ A sophisticated AI-powered email response system that analyzes users' writing st
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/AI-Email-Generator.git
+   git clone https://github.com/GHansen4/AI-Email-Generator.git
    cd AI-Email-Generator
    ```
 
@@ -88,6 +91,11 @@ A sophisticated AI-powered email response system that analyzes users' writing st
    
    # Logging
    LOG_LEVEL=INFO
+   
+   # Security (Optional but Recommended)
+   ENCRYPTION_KEY=your_encryption_key
+   MAX_REQUESTS_PER_MINUTE=30
+   CONTENT_SANITIZATION_ENABLED=true
    ```
 
 4. **Database Setup**
@@ -137,6 +145,37 @@ Body: [Original forwarded email content]
 
 - `POST /webhook/mailgun` - Mailgun webhook for processing incoming emails
 - Health check and monitoring endpoints available
+
+## 🧪 Testing
+
+### Running Tests
+
+```bash
+# Run all tests
+pytest
+
+# Run specific test file
+pytest tests/test_email_parser.py
+
+# Run with verbose output
+pytest -v
+
+# Run with coverage
+pytest --cov=app tests/
+```
+
+### Test Structure
+
+- `tests/test_email_parser.py` - Email parsing functionality tests
+- Additional test files for other components as needed
+
+### Test Coverage
+
+The test suite covers:
+- Email parsing and content extraction
+- Writing profile analysis
+- Security validation functions
+- Error handling scenarios
 
 ## 🧠 How It Works
 
