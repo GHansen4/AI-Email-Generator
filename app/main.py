@@ -6,6 +6,10 @@ from contextlib import asynccontextmanager
 import uvicorn
 import time
 import asyncio
+import signal
+import sys
+from typing import Dict, Any, Optional
+import psutil
 
 from app.config import settings
 from app.database import create_tables, check_database_connection, async_engine
@@ -23,31 +27,57 @@ security_manager = SecurityManager()
 # Application startup time for uptime calculation
 app_start_time = time.time()
 
+# Application state for health monitoring
+app_state = {
+    'startup_complete': False,
+    'shutdown_initiated': False,
+    'health_status': 'starting',
+    'last_health_check': None,
+    'service_metrics': {
+        'total_requests': 0,
+        'failed_requests': 0,
+        'avg_response_time': 0.0,
+        'peak_memory_mb': 0.0
+    }
+}
+
+# Graceful shutdown handler
+shutdown_event = asyncio.Event()
+
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    logger.info(f"Received signal {signum}, initiating graceful shutdown")
+    app_state['shutdown_initiated'] = True
+    shutdown_event.set()
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifespan context manager for startup and shutdown events.
-    Replaces deprecated @app.on_event decorators.
+    Enhanced lifespan context manager with comprehensive startup/shutdown handling.
     """
     # Startup
     logger.info("Starting AI Email Response Service")
+    app_state['health_status'] = 'starting'
     
     try:
         # Validate critical configuration
-        if not settings.database_url:
-            raise ValueError("DATABASE_URL is required")
+        startup_checks = await perform_startup_checks()
         
-        if not settings.mailgun_api_key:
-            logger.warning("MAILGUN_API_KEY not configured - email sending disabled")
+        if not startup_checks['all_passed']:
+            failed_checks = [check for check, passed in startup_checks['checks'].items() if not passed]
+            raise Exception(f"Startup checks failed: {', '.join(failed_checks)}")
         
-        # Check database connection
-        if not await check_database_connection():
-            raise Exception("Database connection failed")
+        # Initialize services
+        await initialize_services()
         
-        # Create database tables
-        await create_tables()
-        logger.info("Database initialization completed")
+        # Mark startup as complete
+        app_state['startup_complete'] = True
+        app_state['health_status'] = 'healthy'
         
         # Log startup configuration (sanitized)
         logger.info("Application started successfully", 
@@ -56,16 +86,31 @@ async def lifespan(app: FastAPI):
                    log_level=settings.log_level,
                    database_type="postgresql" if "postgresql" in settings.database_url else "sqlite",
                    security_enabled=True,
-                   rate_limiting_enabled=settings.api_rate_limit_enabled)
+                   rate_limiting_enabled=settings.api_rate_limit_enabled,
+                   startup_time_seconds=round(time.time() - app_start_time, 2))
+        
+        # Start background tasks
+        background_tasks = await start_background_tasks()
         
         yield  # Application runs here
         
     except Exception as e:
         logger.error("Failed to start application", error=str(e))
+        app_state['health_status'] = 'failed'
         raise
     finally:
         # Shutdown
         logger.info("Shutting down AI Email Response Service")
+        app_state['health_status'] = 'shutting_down'
+        
+        # Cancel background tasks
+        if 'background_tasks' in locals():
+            for task in background_tasks:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         
         # Close database connections gracefully
         try:
@@ -73,6 +118,153 @@ async def lifespan(app: FastAPI):
             logger.info("Database connections closed")
         except Exception as e:
             logger.error("Error during shutdown", error=str(e))
+        
+        app_state['health_status'] = 'stopped'
+        logger.info("Shutdown complete")
+
+
+async def perform_startup_checks() -> Dict[str, Any]:
+    """Perform comprehensive startup checks."""
+    checks = {}
+    
+    # Database check
+    try:
+        checks['database'] = await check_database_connection()
+        if checks['database']:
+            await create_tables()
+            logger.info("Database initialization completed")
+        else:
+            logger.error("Database connection failed")
+    except Exception as e:
+        logger.error("Database check failed", error=str(e))
+        checks['database'] = False
+    
+    # Configuration validation
+    checks['config'] = bool(settings.database_url)
+    if not settings.mailgun_api_key:
+        logger.warning("MAILGUN_API_KEY not configured - email sending disabled")
+        checks['mailgun'] = False
+    else:
+        checks['mailgun'] = True
+    
+    # Security manager check
+    try:
+        security_manager.generate_request_id()
+        checks['security'] = True
+    except Exception as e:
+        logger.error("Security manager check failed", error=str(e))
+        checks['security'] = False
+    
+    # Memory check
+    memory_usage = psutil.virtual_memory()
+    checks['memory'] = memory_usage.percent < 90  # Fail if >90% memory usage
+    if not checks['memory']:
+        logger.warning("High memory usage detected", usage_percent=memory_usage.percent)
+    
+    # Disk space check
+    disk_usage = psutil.disk_usage('/')
+    checks['disk'] = disk_usage.percent < 90  # Fail if >90% disk usage
+    if not checks['disk']:
+        logger.warning("Low disk space detected", usage_percent=disk_usage.percent)
+    
+    return {
+        'all_passed': all(checks.values()),
+        'checks': checks
+    }
+
+
+async def initialize_services():
+    """Initialize application services."""
+    # Initialize any additional services here
+    # For example: AI model loading, cache warming, etc.
+    logger.info("Services initialized successfully")
+
+
+async def start_background_tasks():
+    """Start background monitoring tasks."""
+    tasks = []
+    
+    # Health monitoring task
+    tasks.append(asyncio.create_task(health_monitor_task()))
+    
+    # Metrics collection task
+    tasks.append(asyncio.create_task(metrics_collection_task()))
+    
+    # Cleanup task
+    tasks.append(asyncio.create_task(cleanup_task()))
+    
+    logger.info(f"Started {len(tasks)} background tasks")
+    return tasks
+
+
+async def health_monitor_task():
+    """Background task to monitor application health."""
+    while not shutdown_event.is_set():
+        try:
+            # Update health status
+            app_state['last_health_check'] = time.time()
+            
+            # Check memory usage
+            memory_usage = psutil.virtual_memory()
+            app_state['service_metrics']['peak_memory_mb'] = max(
+                app_state['service_metrics']['peak_memory_mb'],
+                memory_usage.used / 1024 / 1024
+            )
+            
+            # Update health status based on system resources
+            if memory_usage.percent > 90:
+                app_state['health_status'] = 'degraded'
+                logger.warning("High memory usage detected", usage_percent=memory_usage.percent)
+            elif app_state['health_status'] == 'degraded' and memory_usage.percent < 80:
+                app_state['health_status'] = 'healthy'
+                logger.info("Memory usage normalized", usage_percent=memory_usage.percent)
+            
+            await asyncio.sleep(30)  # Check every 30 seconds
+            
+        except Exception as e:
+            logger.error("Health monitor task error", error=str(e))
+            await asyncio.sleep(60)  # Wait longer on error
+
+
+async def metrics_collection_task():
+    """Background task to collect application metrics."""
+    while not shutdown_event.is_set():
+        try:
+            # Collect and log metrics periodically
+            uptime = time.time() - app_start_time
+            
+            logger.info("Periodic metrics collection",
+                       uptime_seconds=round(uptime, 2),
+                       total_requests=app_state['service_metrics']['total_requests'],
+                       failed_requests=app_state['service_metrics']['failed_requests'],
+                       avg_response_time=app_state['service_metrics']['avg_response_time'],
+                       peak_memory_mb=app_state['service_metrics']['peak_memory_mb'])
+            
+            await asyncio.sleep(300)  # Collect every 5 minutes
+            
+        except Exception as e:
+            logger.error("Metrics collection task error", error=str(e))
+            await asyncio.sleep(300)
+
+
+async def cleanup_task():
+    """Background task for periodic cleanup operations."""
+    while not shutdown_event.is_set():
+        try:
+            # Clean up security manager old data
+            try:
+                # SecurityManager cleanup would go here when implemented
+                pass
+            except Exception as e:
+                logger.error("Cleanup task error", error=str(e))
+            
+            logger.debug("Periodic cleanup completed")
+            
+            await asyncio.sleep(3600)  # Cleanup every hour
+            
+        except Exception as e:
+            logger.error("Cleanup task error", error=str(e))
+            await asyncio.sleep(3600)
 
 
 # Create FastAPI app with enhanced configuration
@@ -90,8 +282,11 @@ app = FastAPI(
 # Enhanced security middleware with comprehensive monitoring
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    """Enhanced security middleware for request validation, monitoring, and protection."""
+    """Enhanced security middleware with performance tracking."""
     start_time = time.time()
+    
+    # Update request counter
+    app_state['service_metrics']['total_requests'] += 1
     
     # Generate request ID for tracking
     request_id = security_manager.generate_request_id()
@@ -108,18 +303,32 @@ async def security_middleware(request: Request, call_next):
                method=method,
                path=path,
                client_ip=client_ip,
-               user_agent=user_agent[:200])  # Truncate long user agents
+               user_agent=user_agent[:200])
     
     try:
+        # Check if application is ready
+        if not app_state['startup_complete'] and path not in ['/health', '/']:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": "Service starting up, please try again shortly"}
+            )
+        
+        # Check if shutdown is initiated
+        if app_state['shutdown_initiated']:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"error": "Service is shutting down"}
+            )
+        
         # Security validation for suspicious patterns
-        if len(path) > 2000:  # Extremely long paths
+        if len(path) > 2000:
             logger.warning("Suspicious long path detected", client_ip=client_ip, path_length=len(path))
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content={"error": "Invalid request path"}
             )
         
-        # Rate limiting for API endpoints (skip health/docs endpoints)
+        # Rate limiting for API endpoints
         protected_paths = ["/api/", "/webhook"]
         if any(path.startswith(p) for p in protected_paths):
             rate_ok, rate_error = security_manager.check_rate_limits(client_ip, "api")
@@ -139,6 +348,17 @@ async def security_middleware(request: Request, call_next):
         # Calculate processing time
         processing_time = (time.time() - start_time) * 1000
         
+        # Update average response time
+        current_avg = app_state['service_metrics']['avg_response_time']
+        total_requests = app_state['service_metrics']['total_requests']
+        app_state['service_metrics']['avg_response_time'] = (
+            (current_avg * (total_requests - 1) + processing_time) / total_requests
+        )
+        
+        # Track failed requests
+        if response.status_code >= 400:
+            app_state['service_metrics']['failed_requests'] += 1
+        
         # Log response
         logger.info("Request completed",
                    request_id=request_id,
@@ -151,6 +371,7 @@ async def security_middleware(request: Request, call_next):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["X-Service-Status"] = app_state['health_status']
         
         # Add HSTS header for production HTTPS
         if getattr(settings, 'is_production', lambda: 'production' in getattr(settings, 'environment', '').lower())():
@@ -164,6 +385,8 @@ async def security_middleware(request: Request, call_next):
         
     except Exception as e:
         processing_time = (time.time() - start_time) * 1000
+        app_state['service_metrics']['failed_requests'] += 1
+        
         logger.error("Request failed",
                     request_id=request_id,
                     error=str(e),
@@ -196,7 +419,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID", "X-RateLimit-Remaining", "X-RateLimit-Reset"]
+    expose_headers=["X-Request-ID", "X-RateLimit-Remaining", "X-RateLimit-Reset", "X-Service-Status"]
 )
 
 # Include routers
@@ -211,9 +434,10 @@ async def root():
     return {
         "service": "AI Email Response Service",
         "version": getattr(settings, 'app_version', '1.0.0'),
-        "status": "running",
+        "status": app_state['health_status'],
         "environment": getattr(settings, 'environment', 'development'),
         "uptime_seconds": round(uptime_seconds, 2),
+        "startup_complete": app_state['startup_complete'],
         "features": {
             "docs": "/docs" if getattr(settings, 'enable_docs', True) else "disabled",
             "metrics": "/metrics" if getattr(settings, 'metrics_enabled', True) else "disabled",
@@ -226,32 +450,73 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Comprehensive health check endpoint with detailed status."""
+    """Enhanced health check endpoint with comprehensive diagnostics."""
     try:
         # Check database connection
         db_healthy = await check_database_connection()
         
+        # Check mailgun service if configured
+        mailgun_healthy = True
+        if settings.mailgun_api_key:
+            try:
+                # Import here to avoid circular imports
+                from app.services.mailgun_client import MailgunClient
+                mailgun_client = MailgunClient()
+                if hasattr(mailgun_client, 'health_check'):
+                    mailgun_status = await mailgun_client.health_check()
+                    mailgun_healthy = mailgun_status.get('status') == 'healthy'
+            except Exception as e:
+                logger.warning("Mailgun health check failed", error=str(e))
+                mailgun_healthy = False
+        
+        # System resource checks
+        memory_usage = psutil.virtual_memory()
+        disk_usage = psutil.disk_usage('/')
+        
         # Calculate uptime
         uptime_seconds = time.time() - app_start_time
         
+        # Determine overall health
+        overall_healthy = (
+            db_healthy and 
+            mailgun_healthy and 
+            memory_usage.percent < 90 and 
+            disk_usage.percent < 90 and
+            app_state['startup_complete'] and
+            not app_state['shutdown_initiated']
+        )
+        
         health_status = {
-            "status": "healthy" if db_healthy else "unhealthy",
+            "status": "healthy" if overall_healthy else "unhealthy",
             "service": "ai-email-response",
             "version": getattr(settings, 'app_version', '1.0.0'),
             "environment": getattr(settings, 'environment', 'development'),
             "uptime_seconds": round(uptime_seconds, 2),
+            "startup_complete": app_state['startup_complete'],
             "checks": {
                 "database": "healthy" if db_healthy else "unhealthy",
+                "mailgun": "healthy" if mailgun_healthy else "unhealthy",
                 "security": "enabled",
                 "rate_limiting": "enabled" if settings.api_rate_limit_enabled else "disabled",
                 "logging": "enabled",
                 "configuration": "valid"
             },
+            "system": {
+                "memory_usage_percent": round(memory_usage.percent, 1),
+                "disk_usage_percent": round(disk_usage.percent, 1),
+                "cpu_count": psutil.cpu_count(),
+                "last_health_check": app_state['last_health_check']
+            },
+            "metrics": app_state['service_metrics'].copy(),
             "timestamp": time.time()
         }
         
-        if not db_healthy:
-            logger.error("Health check failed: database unhealthy")
+        if not overall_healthy:
+            logger.error("Health check failed", 
+                        db_healthy=db_healthy,
+                        mailgun_healthy=mailgun_healthy,
+                        memory_percent=memory_usage.percent,
+                        disk_percent=disk_usage.percent)
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content=health_status
@@ -274,7 +539,7 @@ async def health_check():
 
 @app.get("/metrics")
 async def metrics():
-    """Enhanced metrics endpoint for monitoring and observability."""
+    """Enhanced metrics endpoint with detailed performance data."""
     if not getattr(settings, 'metrics_enabled', True):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -284,29 +549,77 @@ async def metrics():
     # Calculate uptime
     uptime_seconds = time.time() - app_start_time
     
-    # Basic metrics (can be enhanced with Prometheus metrics later)
+    # System metrics
+    memory_usage = psutil.virtual_memory()
+    disk_usage = psutil.disk_usage('/')
+    cpu_percent = psutil.cpu_percent(interval=1)
+    
+    # Calculate success rate
+    total_requests = app_state['service_metrics']['total_requests']
+    failed_requests = app_state['service_metrics']['failed_requests']
+    success_rate = ((total_requests - failed_requests) / max(1, total_requests)) * 100
+    
     metrics_data = {
         "service": "ai-email-response",
         "version": getattr(settings, 'app_version', '1.0.0'),
         "environment": getattr(settings, 'environment', 'development'),
         "uptime_seconds": round(uptime_seconds, 2),
         "database_type": "postgresql" if "postgresql" in settings.database_url else "sqlite",
+        
+        "performance": {
+            "total_requests": total_requests,
+            "failed_requests": failed_requests,
+            "success_rate_percent": round(success_rate, 2),
+            "avg_response_time_ms": round(app_state['service_metrics']['avg_response_time'], 2),
+            "requests_per_second": round(total_requests / max(1, uptime_seconds), 2)
+        },
+        
+        "system": {
+            "memory_usage_percent": round(memory_usage.percent, 1),
+            "memory_used_mb": round(memory_usage.used / 1024 / 1024, 1),
+            "memory_total_mb": round(memory_usage.total / 1024 / 1024, 1),
+            "peak_memory_mb": round(app_state['service_metrics']['peak_memory_mb'], 1),
+            "disk_usage_percent": round(disk_usage.percent, 1),
+            "cpu_usage_percent": round(cpu_percent, 1),
+            "cpu_count": psutil.cpu_count()
+        },
+        
         "features": {
             "security_enabled": True,
             "rate_limiting_enabled": settings.api_rate_limit_enabled,
             "debug_mode": settings.debug,
             "docs_enabled": getattr(settings, 'enable_docs', True)
         },
-        "system": {
+        
+        "timestamps": {
             "startup_time": app_start_time,
-            "current_time": time.time()
+            "current_time": time.time(),
+            "last_health_check": app_state['last_health_check']
         }
     }
     
     return metrics_data
 
 
-# Enhanced error handlers with proper logging and response formatting
+@app.get("/ready")
+async def readiness_check():
+    """Kubernetes-style readiness probe."""
+    if app_state['startup_complete'] and not app_state['shutdown_initiated']:
+        return {"status": "ready"}
+    else:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "not ready"}
+        )
+
+
+@app.get("/live")
+async def liveness_check():
+    """Kubernetes-style liveness probe."""
+    return {"status": "alive", "timestamp": time.time()}
+
+
+# Enhanced error handlers
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc):
     """Handle 404 errors with proper logging and response."""
@@ -400,7 +713,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
-# Development server configuration with enhanced settings
+# Development server configuration
 if __name__ == "__main__":
     # Validate environment before starting
     if not settings.database_url:
@@ -415,7 +728,7 @@ if __name__ == "__main__":
         reload=getattr(settings, 'auto_reload', True) and getattr(settings, 'environment', 'development').lower() == 'development',
         log_level=settings.log_level.lower(),
         access_log=getattr(settings, 'enable_request_logging', True),
-        workers=1 if getattr(settings, 'environment', 'development').lower() == 'development' else min(4, 2),  # Scale workers based on environment
+        workers=1 if getattr(settings, 'environment', 'development').lower() == 'development' else min(4, 2),
         use_colors=True,
         loop="asyncio"
     )

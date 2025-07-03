@@ -24,6 +24,9 @@ nltk>=3.8.1
 spacy>=3.7.2
 textstat>=0.7.3
 
+# AI Services
+anthropic>=0.57.0
+
 # Async support
 asyncpg>=0.28.0  # For PostgreSQL async support
 aiosqlite>=0.19.0  # For SQLite async support
