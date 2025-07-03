@@ -1,34 +1,94 @@
-import asyncio
+from fastapi import APIRouter, Request, HTTPException, Depends, status, Form
+from fastapi.responses import JSONResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 from datetime import datetime
-from fastapi import APIRouter, Form, HTTPException, Depends, Request
-from sqlalchemy.orm import Session
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import json
+import time
 
-from app.database import get_db
-from app.models.user import User, WritingProfile
-from app.models.email import EmailLog, ForwardedEmail
-from app.services.email_parser import EmailParser
+from app.database import (
+    get_db, User, WritingProfile, EmailLog, SecurityEvent,
+    get_user_by_email, create_user, get_or_create_user,
+    log_email_processing, log_security_event
+)
 from app.services.profile_analyzer import WritingProfileAnalyzer
+from app.services.email_parser import EmailParser
 from app.services.ai_generator import AIResponseGenerator
 from app.services.mailgun_client import MailgunClient
-from app.utils.security import (
-    verify_mailgun_webhook, 
-    validate_email_request, 
-    sanitize_content,
-    SecurityManager
-)
-from app.utils.logging import get_logger
+from app.utils.security import SecurityManager, verify_webhook_signature, validate_email_request, sanitize_content
+from app.utils.logging import get_logger, LoggingTimer
 from app.config import settings
 
 logger = get_logger(__name__)
 router = APIRouter()
 
 # Initialize services
-email_parser = EmailParser()
 profile_analyzer = WritingProfileAnalyzer()
+email_parser = EmailParser()
 ai_generator = AIResponseGenerator()
 mailgun_client = MailgunClient()
 security_manager = SecurityManager()
+
+
+# Create a result class for email parsing
+class EmailParseResult:
+    def __init__(self, email_type: str, user_content: Optional[str] = None, 
+                 original_content: Optional[str] = None, original_sender: Optional[str] = None,
+                 original_subject: Optional[str] = None, confidence_score: float = 0.5):
+        self.email_type = email_type
+        self.user_content = user_content
+        self.original_content = original_content
+        self.original_sender = original_sender
+        self.original_subject = original_subject
+        self.confidence_score = confidence_score
+
+
+def parse_email_content(content: str, sender_email: str, subject: str) -> EmailParseResult:
+    """Parse email content and determine type and extract relevant parts."""
+    try:
+        # Determine email type based on subject
+        if subject.upper().startswith("PROFILE:"):
+            # Profile email - extract user's writing from the content
+            # Remove the profile instruction and get the actual user writing
+            user_writing = content
+            if "PROFILE:" in content.upper():
+                # Remove any profile instructions
+                lines = content.split('\n')
+                user_lines = [line for line in lines if not line.upper().strip().startswith("PROFILE")]
+                user_writing = '\n'.join(user_lines).strip()
+            
+            return EmailParseResult(
+                email_type="profile",
+                user_content=user_writing,
+                confidence_score=0.8
+            )
+        else:
+            # Response request - parse forwarded email
+            parsed_result = email_parser.parse_forwarded_email(content, is_html=False)
+            
+            if parsed_result.get('success', False):
+                return EmailParseResult(
+                    email_type="response_request",
+                    original_content=parsed_result.get('original_content'),
+                    original_sender=parsed_result.get('original_from'),
+                    original_subject=parsed_result.get('original_subject'),
+                    confidence_score=0.9
+                )
+            else:
+                # Fallback - treat as response request with full content
+                return EmailParseResult(
+                    email_type="response_request",
+                    original_content=content,
+                    confidence_score=0.3
+                )
+                
+    except Exception as e:
+        logger.error("Error parsing email content", error=str(e))
+        return EmailParseResult(
+            email_type="unknown",
+            confidence_score=0.1
+        )
 
 
 @router.post("/webhook/mailgun")
@@ -43,7 +103,7 @@ async def mailgun_webhook(
     body_plain: str = Form(default=""),
     body_html: str = Form(default=""),
     message_id: str = Form(...),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Handle incoming emails from Mailgun webhook with comprehensive security.
@@ -53,23 +113,32 @@ async def mailgun_webhook(
     """
     request_id = security_manager.generate_request_id()
     client_ip = getattr(request.client, 'host', 'unknown') if request.client else 'unknown'
+    processing_start = time.time()
     
+    logger.info("Webhook received", 
+               request_id=request_id,
+               sender=sender,
+               subject=subject,
+               message_id=message_id)
+
     # Security Layer 1: Webhook Signature Verification (CRITICAL)
     try:
-        if not verify_mailgun_webhook(timestamp, token, signature):
-            logger.error("Webhook signature verification failed", 
+        if not verify_webhook_signature(timestamp, token, signature):
+            await log_security_event(
+                db, "webhook_signature_invalid", "high",
+                source_ip=client_ip, source_email=sender,
+                event_data={"message_id": message_id, "timestamp": timestamp}
+            )
+            logger.error("Invalid webhook signature", 
                         request_id=request_id,
                         sender=sender,
-                        client_ip=client_ip,
                         security_event=True)
-            security_manager.log_failed_attempt(client_ip, "invalid_webhook_signature")
-            raise HTTPException(status_code=401, detail="Unauthorized: Invalid webhook signature")
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error("Error in webhook verification", 
-                    error=str(e), 
-                    request_id=request_id,
-                    security_event=True)
-        raise HTTPException(status_code=401, detail="Unauthorized: Webhook verification failed")
+        logger.error("Webhook verification error", error=str(e), request_id=request_id)
+        raise HTTPException(status_code=401, detail="Webhook verification failed")
 
     # Security Layer 2: Email Validation and Rate Limiting
     email_content = body_plain or body_html
@@ -80,21 +149,21 @@ async def mailgun_webhook(
             identifier=client_ip
         )
         if not is_valid:
-            logger.warning("Email request validation failed", 
+            await log_security_event(
+                db, "email_validation_failed", "medium",
+                source_ip=client_ip, source_email=sender,
+                event_data={"error": validation_error, "message_id": message_id}
+            )
+            logger.warning("Email validation failed", 
                           sender=sender,
                           error=validation_error,
-                          request_id=request_id,
-                          security_event=True)
-            security_manager.log_failed_attempt(sender, f"validation_failed: {validation_error}")
-            raise HTTPException(status_code=400, detail=f"Bad Request: {validation_error}")
+                          request_id=request_id)
+            raise HTTPException(status_code=400, detail=validation_error)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error in email validation", 
-                    error=str(e), 
-                    request_id=request_id,
-                    security_event=True)
-        raise HTTPException(status_code=400, detail="Bad Request: Email validation failed")
+        logger.error("Email validation error", error=str(e), request_id=request_id)
+        raise HTTPException(status_code=400, detail="Email validation failed")
 
     # Security Layer 3: Content Sanitization
     try:
@@ -102,334 +171,348 @@ async def mailgun_webhook(
             email_content = sanitize_content(email_content)
             subject = sanitize_content(subject)
     except Exception as e:
-        logger.error("Error in content sanitization", 
-                    error=str(e), 
-                    request_id=request_id)
+        logger.error("Content sanitization error", error=str(e), request_id=request_id)
         # Continue processing but log the error
 
-    # Start email processing with security logging
-    logger.info("Email processing started", sender=sender, email_type="webhook_received")
-    
-    processing_start_time = datetime.utcnow()
+    # Start main processing
     try:
         # Get or create user
-        user = get_or_create_user(db, sender)
+        user = await get_or_create_user(db, sender)
         
-        # Create email log entry and commit immediately to get ID
-        email_log = EmailLog(
-            user_id=user.id,
-            message_id=message_id,
-            from_email=sender,
-            to_email=recipient,
-            subject=subject,
-            raw_content=email_content,
-            processing_status="processing"
+        # Determine email type
+        email_type = "profile" if subject.upper().startswith("PROFILE:") else "response_request"
+        
+        # Log email processing start
+        email_log = await log_email_processing(
+            db, sender, subject, email_type, "processing",
+            processing_time_ms=0
         )
-        db.add(email_log)
-        db.commit()  # Commit early to get the ID
-        db.refresh(email_log)  # Refresh to get the assigned ID
         
-        # Determine email type and process accordingly
-        try:
-            if subject.upper().startswith("PROFILE:"):
-                await process_profile_email(db, email_log, user, email_content, request_id)
-            else:
-                await process_response_request(db, email_log, user, body_plain, body_html, request_id)
+        # Process based on email type
+        if email_type == "profile":
+            result = await process_profile_email(
+                db, user, email_content, subject, request_id
+            )
+        else:
+            result = await process_response_request(
+                db, user, email_content, subject, request_id
+            )
+        
+        # Update email log with results
+        processing_time_ms = (time.time() - processing_start) * 1000
+        email_log.processing_status = "success" if result["success"] else "failed"
+        
+        # Handle optional fields properly
+        error_msg = result.get("error")
+        if error_msg:
+            email_log.error_message = error_msg
             
-            # Final commit for all changes
-            db.commit()
+        confidence_val = result.get("confidence_score")
+        if confidence_val is not None:
+            email_log.confidence_score = confidence_val
             
-            # Log successful completion
-            processing_time = int((datetime.utcnow() - processing_start_time).total_seconds() * 1000)
-            logger.info("Email processing completed", 
-                       sender=sender, 
-                       email_type=str(email_log.email_type or "unknown"), 
-                       processing_time_ms=processing_time,
-                       success=True)
-            
-        except Exception as process_error:
-            # Rollback any changes from processing functions
-            db.rollback()
-            
-            # Update email log with error status
-            email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-            email_log.error_message = str(process_error)  # type: ignore  # SQLAlchemy column assignment
-            db.add(email_log)
-            db.commit()
-            
-            # Log failed processing
-            security_manager.log_failed_attempt(sender, f"processing_error: {str(process_error)}")
-            logger.error("Error in email processing", 
-                       error=str(process_error), 
-                       email_log_id=email_log.id,
-                       request_id=request_id,
-                       security_event=True)
-            raise process_error
+        email_log.processing_time_ms = processing_time_ms
+        email_log.processed_at = datetime.utcnow()
+        
+        await db.commit()
+        
+        logger.info("Email processing completed", 
+                   request_id=request_id,
+                   sender=sender,
+                   email_type=email_type,
+                   success=result["success"],
+                   processing_time_ms=processing_time_ms)
         
         return {
-            "status": "success", 
-            "message": "Email processed successfully",
+            "status": "success" if result["success"] else "error",
+            "message": result.get("message", "Email processed"),
             "request_id": request_id
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Error processing webhook", 
+        # Log the error and attempt to update email log
+        try:
+            processing_time_ms = (time.time() - processing_start) * 1000
+            await log_email_processing(
+                db, sender, subject, "unknown", "failed",
+                processing_time_ms=processing_time_ms,
+                error_message=str(e),
+                error_type=type(e).__name__
+            )
+            await db.commit()
+        except Exception as log_error:
+            logger.error("Failed to log error", error=str(log_error), request_id=request_id)
+        
+        await log_security_event(
+            db, "webhook_processing_error", "high",
+            source_ip=client_ip, source_email=sender,
+            event_data={"error": str(e), "message_id": message_id}
+        )
+        
+        logger.error("Webhook processing failed", 
                     error=str(e), 
                     request_id=request_id,
                     security_event=True)
-        
-        # Attempt to rollback any incomplete transactions
-        try:
-            db.rollback()
-        except Exception as rollback_error:
-            logger.error("Failed to rollback transaction", 
-                       error=str(rollback_error),
-                       request_id=request_id)
-        
-        # Log security event
-        security_manager.log_failed_attempt(client_ip, f"webhook_processing_error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-async def process_profile_email(db: Session, email_log: EmailLog, user: User, content: str, request_id: str):
-    """Process profile-building email with enhanced security."""
+async def process_profile_email(
+    db: AsyncSession, 
+    user: User, 
+    content: str, 
+    subject: str,
+    request_id: str
+) -> Dict[str, Any]:
+    """Process profile-building email with proper database integration."""
     try:
-        email_log.email_type = "profile"  # type: ignore  # SQLAlchemy column assignment
+        logger.info("Processing profile email", user_id=user.id, request_id=request_id)
         
-        # Security: Additional content validation for profile emails
+        # Security: Validate content size
         if len(content) > settings.max_email_size:
-            raise ValueError(f"Profile content too large (max {settings.max_email_size} bytes)")
+            return {
+                "success": False,
+                "error": f"Content too large (max {settings.max_email_size} bytes)"
+            }
         
-        # Extract content for profile analysis
-        profile_content = email_parser.extract_profile_content(content, str(email_log.subject))
+        # Use the robust email parser to extract user's writing
+        parsed_result = parse_email_content(content, user.email, subject)
         
-        if not profile_content:
-            logger.warning("No valid content extracted for profile", 
-                          user_id=user.id, 
-                          request_id=request_id)
-            email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-            email_log.error_message = "Could not extract valid content for profile analysis"  # type: ignore  # SQLAlchemy column assignment
-            return
+        if parsed_result.email_type != "profile" or not parsed_result.user_content:
+            return {
+                "success": False,
+                "error": "Could not extract user writing content for profile analysis"
+            }
         
-        # Security: Sanitize profile content before analysis
-        if settings.content_sanitization_enabled:
-            profile_content = sanitize_content(profile_content)
+        user_writing = parsed_result.user_content
         
-        # Analyze writing style (now comprehensive by default)
-        analysis_result = profile_analyzer.analyze_writing_style(profile_content)
+        if len(user_writing.strip()) < 50:
+            return {
+                "success": False,
+                "error": "Insufficient writing content for analysis (minimum 50 characters)"
+            }
         
-        # Get existing writing profile or create new one
-        writing_profile = db.query(WritingProfile).filter(
-            WritingProfile.user_id == user.id
-        ).first()
+        # Analyze writing style using your comprehensive analyzer
+        with LoggingTimer(logger, "writing_analysis", user_id=user.id):
+            analysis_result = profile_analyzer.analyze_writing_style(user_writing)
         
-        if writing_profile:
+        confidence_score = analysis_result.get('confidence_score', 0.1)
+        
+        # Get existing writing profile
+        result = await db.execute(
+            select(WritingProfile).where(WritingProfile.user_id == user.id)
+        )
+        existing_profile = result.scalar_one_or_none()
+        
+        if existing_profile:
+            # Decrypt existing profile data
+            try:
+                existing_data = json.loads(
+                    security_manager.decrypt_sensitive_data(existing_profile.profile_data)
+                )
+                sample_count = existing_data.get('sample_count', 0)
+            except Exception as e:
+                logger.warning("Could not decrypt existing profile", 
+                             user_id=user.id, error=str(e))
+                existing_data = profile_analyzer._get_default_profile()
+                sample_count = 0
+            
             # Merge with existing profile
             merged_profile = profile_analyzer.merge_profiles(
-                {
-                    'avg_sentence_length': writing_profile.avg_sentence_length,
-                    'avg_paragraph_length': writing_profile.avg_paragraph_length,
-                    'formality_score': writing_profile.formality_score,
-                    'enthusiasm_score': writing_profile.enthusiasm_score,
-                    'common_greetings': writing_profile.common_greetings or [],
-                    'common_closings': writing_profile.common_closings or [],
-                    'common_phrases': writing_profile.common_phrases or [],
-                    'vocabulary_level': writing_profile.vocabulary_level
-                },
-                analysis_result,
-                int(writing_profile.sample_count)  # type: ignore[arg-type]  # SQLAlchemy column conversion
+                existing_data, analysis_result, sample_count
             )
+            merged_profile['sample_count'] = sample_count + 1
+            merged_profile['confidence_score'] = min(1.0, merged_profile['sample_count'] / 10.0)
             
             # Update existing profile
-            writing_profile.avg_sentence_length = merged_profile['avg_sentence_length']
-            writing_profile.avg_paragraph_length = merged_profile['avg_paragraph_length']
-            writing_profile.formality_score = merged_profile['formality_score']
-            writing_profile.enthusiasm_score = merged_profile['enthusiasm_score']
-            writing_profile.common_greetings = merged_profile['common_greetings']
-            writing_profile.common_closings = merged_profile['common_closings']
-            writing_profile.common_phrases = merged_profile['common_phrases']
-            writing_profile.vocabulary_level = merged_profile['vocabulary_level']
-            writing_profile.sample_count = writing_profile.sample_count + 1  # type: ignore  # SQLAlchemy column operation
-            writing_profile.confidence_score = min(1.0, float(writing_profile.sample_count) * 0.1)  # type: ignore[arg-type]  # SQLAlchemy column conversion
-            writing_profile.updated_at = datetime.utcnow()  # type: ignore  # SQLAlchemy column assignment
+            existing_profile.profile_data = security_manager.encrypt_sensitive_data(
+                json.dumps(merged_profile)
+            )
+            existing_profile.fingerprint_data = security_manager.encrypt_sensitive_data(
+                json.dumps(merged_profile.get('comprehensive_fingerprint', {}))
+            )
+            existing_profile.version += 1
+            existing_profile.updated_at = datetime.utcnow()
+            
+            final_profile = merged_profile
             
         else:
             # Create new profile
-            writing_profile = WritingProfile(
+            analysis_result['sample_count'] = 1
+            analysis_result['confidence_score'] = 0.1
+            
+            new_profile = WritingProfile(
                 user_id=user.id,
-                avg_sentence_length=analysis_result['avg_sentence_length'],
-                avg_paragraph_length=analysis_result['avg_paragraph_length'],
-                formality_score=analysis_result['formality_score'],
-                enthusiasm_score=analysis_result['enthusiasm_score'],
-                common_greetings=analysis_result['common_greetings'],
-                common_closings=analysis_result['common_closings'],
-                common_phrases=analysis_result['common_phrases'],
-                vocabulary_level=analysis_result['vocabulary_level'],
-                sample_count=1,
-                confidence_score=0.1
+                profile_data=security_manager.encrypt_sensitive_data(
+                    json.dumps(analysis_result)
+                ),
+                fingerprint_data=security_manager.encrypt_sensitive_data(
+                    json.dumps(analysis_result.get('comprehensive_fingerprint', {}))
+                ),
+                version=1
             )
-            db.add(writing_profile)
+            db.add(new_profile)
+            
+            final_profile = analysis_result
         
-        # Generate confirmation response
-        confirmation_message = ai_generator.generate_profile_response(str(user.email))
+        # Update user statistics
+        user.sample_count = final_profile['sample_count']
+        user.confidence_score = final_profile['confidence_score']
+        user.last_profile_update = datetime.utcnow()
         
         # Send confirmation email
-        send_result = await mailgun_client.send_email(
-            to_email=str(user.email),
-            subject="Writing Profile Updated - AI Email Assistant",
-            content=confirmation_message
-        )
+        try:
+            confirmation_result = await mailgun_client.send_profile_confirmation(
+                user.email, 
+                final_profile['sample_count'],
+                final_profile['confidence_score']
+            )
+            
+            if not confirmation_result['success']:
+                logger.warning("Failed to send profile confirmation", 
+                             user_id=user.id,
+                             error=confirmation_result.get('error'))
+        except Exception as e:
+            logger.error("Error sending profile confirmation", 
+                        user_id=user.id, error=str(e))
         
-        if send_result['success']:
-            email_log.processing_status = "completed"  # type: ignore  # SQLAlchemy column assignment
-            logger.info("Profile email processed successfully", 
-                       user_id=user.id, 
-                       request_id=request_id,
-                       sample_count=writing_profile.sample_count)
-        else:
-            email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-            email_log.error_message = f"Failed to send confirmation: {send_result.get('error')}"  # type: ignore  # SQLAlchemy column assignment
+        logger.info("Profile updated successfully", 
+                   user_id=user.id,
+                   sample_count=final_profile['sample_count'],
+                   confidence_score=final_profile['confidence_score'],
+                   parsing_confidence=parsed_result.confidence_score)
+        
+        return {
+            "success": True,
+            "message": "Profile updated successfully",
+            "confidence_score": final_profile['confidence_score'],
+            "sample_count": final_profile['sample_count']
+        }
         
     except Exception as e:
         logger.error("Error processing profile email", 
-                    error=str(e), 
-                    user_id=user.id,
-                    request_id=request_id)
-        email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-        email_log.error_message = str(e)  # type: ignore  # SQLAlchemy column assignment
-        raise  # Re-raise to trigger rollback in main handler
+                    user_id=user.id, error=str(e), request_id=request_id)
+        return {
+            "success": False,
+            "error": f"Profile processing failed: {str(e)}"
+        }
 
 
-async def process_response_request(db: Session, email_log: EmailLog, user: User, 
-                                 body_plain: str, body_html: str, request_id: str):
-    """Process request for AI-generated email response with enhanced security."""
+async def process_response_request(
+    db: AsyncSession, 
+    user: User, 
+    content: str, 
+    subject: str,
+    request_id: str
+) -> Dict[str, Any]:
+    """Process request for AI-generated email response."""
     try:
-        email_log.email_type = "response_request"  # type: ignore  # SQLAlchemy column assignment
+        logger.info("Processing response request", user_id=user.id, request_id=request_id)
         
-        # Parse the forwarded email
-        content = body_plain or body_html
-        is_html = bool(body_html and not body_plain)
-        
-        # Security: Additional content validation
+        # Security: Validate content size
         if len(content) > settings.max_email_size:
-            raise ValueError(f"Email content too large (max {settings.max_email_size} bytes)")
-        
-        # Security: Sanitize content before parsing
-        if settings.content_sanitization_enabled:
-            content = sanitize_content(content)
-        
-        parsed_email = email_parser.parse_forwarded_email(content, is_html)
-        
-        if not parsed_email['success']:
-            logger.warning("Failed to parse forwarded email", 
-                          user_id=user.id,
-                          request_id=request_id)
-            email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-            email_log.error_message = "Could not parse forwarded email"  # type: ignore  # SQLAlchemy column assignment
-            return
-        
-        # Store forwarded email details - NOW email_log.id is available
-        forwarded_email = ForwardedEmail(
-            email_log_id=email_log.id,  # This now has a valid ID
-            original_from=parsed_email.get('original_from'),
-            original_to=parsed_email.get('original_to'),
-            original_subject=parsed_email.get('original_subject'),
-            original_content=parsed_email.get('original_content'),
-            forwarded_by=user.email,
-            forward_type=parsed_email.get('forward_type')
-        )
-        db.add(forwarded_email)
-        
-        # Get user's writing profile
-        writing_profile = db.query(WritingProfile).filter(
-            WritingProfile.user_id == user.id
-        ).first()
-        
-        if not writing_profile:
-            logger.info("No writing profile found, creating default", 
-                       user_id=user.id,
-                       request_id=request_id)
-            # Create basic profile
-            profile_data = profile_analyzer._get_default_profile()
-            profile_data['sample_count'] = 0
-            profile_data['confidence_score'] = 0.0
-        else:
-            profile_data = {
-                'avg_sentence_length': writing_profile.avg_sentence_length,
-                'avg_paragraph_length': writing_profile.avg_paragraph_length,
-                'formality_score': writing_profile.formality_score,
-                'enthusiasm_score': writing_profile.enthusiasm_score,
-                'common_greetings': writing_profile.common_greetings or [],
-                'common_closings': writing_profile.common_closings or [],
-                'common_phrases': writing_profile.common_phrases or [],
-                'vocabulary_level': writing_profile.vocabulary_level,
-                'sample_count': writing_profile.sample_count,
-                'confidence_score': writing_profile.confidence_score
+            return {
+                "success": False,
+                "error": f"Content too large (max {settings.max_email_size} bytes)"
             }
         
-        # Generate AI response
-        start_time = datetime.utcnow()
-        ai_result = ai_generator.generate_response(
-            original_email=parsed_email['original_content'],
-            user_profile=profile_data,
-            context=f"Original sender: {parsed_email.get('original_from')}"
+        # Use the robust email parser to extract original email
+        parsed_result = parse_email_content(content, user.email, subject)
+        
+        if parsed_result.email_type != "response_request" or not parsed_result.original_content:
+            return {
+                "success": False,
+                "error": "Could not parse forwarded email content"
+            }
+        
+        # Get user's writing profile
+        result = await db.execute(
+            select(WritingProfile).where(WritingProfile.user_id == user.id)
         )
-        processing_time = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+        writing_profile = result.scalar_one_or_none()
         
-        # Update email log with AI response details
-        email_log.ai_response = ai_result.get('response')  # type: ignore  # SQLAlchemy column assignment
-        email_log.prompt_used = ai_result.get('prompt_used')  # type: ignore  # SQLAlchemy column assignment
-        email_log.openai_model = ai_result.get('model')  # type: ignore  # SQLAlchemy column assignment
-        email_log.tokens_used = ai_result.get('tokens_used', 0)  # type: ignore  # SQLAlchemy column assignment
-        email_log.response_time_ms = processing_time  # type: ignore  # SQLAlchemy column assignment
+        if writing_profile:
+            try:
+                # Decrypt profile data
+                profile_data = json.loads(
+                    security_manager.decrypt_sensitive_data(writing_profile.profile_data)
+                )
+                confidence_score = profile_data.get('confidence_score', 0.1)
+            except Exception as e:
+                logger.warning("Could not decrypt profile data", 
+                             user_id=user.id, error=str(e))
+                profile_data = profile_analyzer._get_default_profile()
+                confidence_score = 0.1
+        else:
+            logger.info("No writing profile found, using default", user_id=user.id)
+            profile_data = profile_analyzer._get_default_profile()
+            confidence_score = 0.1
         
-        if ai_result['success']:
-            # Send the AI response back to the user
-            response_subject = f"AI Draft Response: {parsed_email.get('original_subject', 'No Subject')}"
+        # Generate AI response using the AI generator
+        with LoggingTimer(logger, "ai_response_generation", user_id=user.id):
+            ai_response_result = ai_generator.generate_response(
+                original_email=parsed_result.original_content,
+                user_profile=profile_data,
+                context=f"Original sender: {parsed_result.original_sender or 'Unknown'}"
+            )
+        
+        if not ai_response_result.get('success', False):
+            return {
+                "success": False,
+                "error": f"AI response generation failed: {ai_response_result.get('error', 'Unknown error')}"
+            }
             
-            send_result = await mailgun_client.send_email(
-                to_email=str(user.email),
-                subject=response_subject,
-                content=ai_result['response']
+        ai_response = ai_response_result.get('response', '')
+        
+        if not ai_response or len(ai_response.strip()) < 10:
+            return {
+                "success": False,
+                "error": "AI response generation failed or produced insufficient content"
+            }
+        
+        # Send response draft to user
+        try:
+            send_result = await mailgun_client.send_ai_response_draft(
+                user.email,
+                parsed_result.original_subject or "No Subject",
+                ai_response,
+                parsed_result.original_content[:200] + "..." if len(parsed_result.original_content) > 200 else parsed_result.original_content,
+                confidence_score
             )
             
-            if send_result['success']:
-                email_log.processing_status = "completed"  # type: ignore  # SQLAlchemy column assignment
-                logger.info("Response email processed successfully", 
-                           user_id=user.id,
-                           request_id=request_id,
-                           processing_time_ms=processing_time)
-            else:
-                email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-                email_log.error_message = f"Failed to send response: {send_result.get('error')}"  # type: ignore  # SQLAlchemy column assignment
-        else:
-            email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-            email_log.error_message = f"AI generation failed: {ai_result.get('error')}"  # type: ignore  # SQLAlchemy column assignment
+            if not send_result['success']:
+                return {
+                    "success": False,
+                    "error": f"Failed to send response draft: {send_result.get('error')}"
+                }
+        except Exception as e:
+            logger.error("Error sending response draft", 
+                        user_id=user.id, error=str(e))
+            return {
+                "success": False,
+                "error": f"Failed to send response draft: {str(e)}"
+            }
+        
+        logger.info("Response request processed successfully", 
+                   user_id=user.id,
+                   confidence_score=confidence_score,
+                   parsing_confidence=parsed_result.confidence_score,
+                   response_length=len(ai_response))
+        
+        return {
+            "success": True,
+            "message": "AI response draft sent successfully",
+            "confidence_score": confidence_score
+        }
         
     except Exception as e:
         logger.error("Error processing response request", 
-                    error=str(e), 
-                    user_id=user.id,
-                    request_id=request_id)
-        email_log.processing_status = "failed"  # type: ignore  # SQLAlchemy column assignment
-        email_log.error_message = str(e)  # type: ignore  # SQLAlchemy column assignment
-        raise  # Re-raise to trigger rollback in main handler
+                    user_id=user.id, error=str(e), request_id=request_id)
+        return {
+            "success": False,
+            "error": f"Response processing failed: {str(e)}"
+        }
 
 
-def get_or_create_user(db: Session, email: str) -> User:
-    """Get existing user or create new one with security logging."""
-    user = db.query(User).filter(User.email == email).first()
-    
-    if not user:
-        user = User(email=email)
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-        logger.info("Created new user", 
-                   email=email, 
-                   user_id=user.id,
-                   security_event=True)
-    
-    return user 
+# These placeholder functions are no longer needed since we're using the robust services

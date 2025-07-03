@@ -1,21 +1,44 @@
-fastapi==0.104.1
-uvicorn[standard]==0.24.0
-sqlalchemy==2.0.23
-alembic==1.12.1
-psycopg2-binary==2.9.9
-pydantic==2.5.0
-pydantic-settings==2.1.0
-python-multipart==0.0.6
-httpx==0.25.2
-anthropic==0.8.1
-python-dotenv==1.0.0
-structlog==23.2.0
-cryptography>=41.0.0
-beautifulsoup4==4.12.2
-lxml==4.9.3
-email-validator==2.1.0
-typing-extensions==4.8.0
-spacy>=3.7.0
+# Core web framework
+fastapi>=0.104.1
+uvicorn>=0.24.0
+
+# Database and ORM
+sqlalchemy>=2.0.23
+psycopg2-binary>=2.9.9  # For PostgreSQL
+alembic>=1.12.1  # Database migrations
+
+# Email processing
+python-email-validator>=2.1.0
+email-reply-parser>=0.5.12
+mailgun-python>=1.0.0
+
+# HTTP client
+httpx>=0.25.2
+requests>=2.31.0
+
+# NLP and Text Processing  
+nltk>=3.8.1
+spacy>=3.7.2
 textstat>=0.7.3
-nltk>=3.8.0
-pytest>=7.4.0 
+
+# Async support
+asyncpg>=0.28.0  # For PostgreSQL async support
+aiosqlite>=0.19.0  # For SQLite async support
+
+# Security and encryption
+cryptography>=41.0.7
+passlib>=1.7.4
+python-jose>=3.3.0
+
+# Configuration and environment
+pydantic>=2.5.0
+python-dotenv>=1.0.0
+pydantic-settings>=2.1.0
+
+# Utility libraries
+pytest>=7.4.0
+python-multipart>=0.0.6
+
+# Development and testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
