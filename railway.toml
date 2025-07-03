@@ -1,0 +1,14 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+
+[env]
+PORT = { default = "8000" }
+PYTHONPATH = { default = "." }
+
+[[services]]
+name = "ai-email-service" 
