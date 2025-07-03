@@ -6,12 +6,13 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from app.config import settings
 from app.utils.logging import get_logger
+from app.utils.security import validate_email_address, SecurityManager
 
 logger = get_logger(__name__)
 
 
 class MailgunClient:
-    """Enhanced client for sending emails via Mailgun API for email AI service."""
+    """Enhanced client for sending emails via Mailgun API with comprehensive security integration."""
     
     def __init__(self):
         self.api_key = settings.mailgun_api_key
@@ -19,19 +20,19 @@ class MailgunClient:
         self.base_url = f"https://api.mailgun.net/v3/{self.domain}"
         self.service_email = settings.service_email
         
+        # Initialize security manager
+        self.security_manager = SecurityManager()
+        
         # Rate limiting: track sends per email address
         self._rate_limits = defaultdict(list)
-        self._max_emails_per_hour = 20  # Configurable limit
+        self._max_emails_per_hour = getattr(settings, 'max_emails_per_hour', 20)
         
-    def _validate_email(self, email: str) -> bool:
-        """Validate email address format."""
-        if not email or len(email) > 254:
-            return False
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email) is not None
+    def _validate_email_security(self, email: str) -> bool:
+        """Validate email address using enhanced security validation."""
+        return validate_email_address(email)
     
-    async def _check_rate_limit(self, email: str) -> bool:
-        """Check if email address is within rate limits."""
+    async def _check_rate_limit(self, email: str, request_id: Optional[str] = None) -> bool:
+        """Check if email address is within rate limits with security logging."""
         now = datetime.now()
         hour_ago = now - timedelta(hours=1)
         
@@ -43,17 +44,24 @@ class MailgunClient:
         
         # Check limit
         if len(self._rate_limits[email]) >= self._max_emails_per_hour:
-            logger.warning("Rate limit exceeded", email=email, 
-                          count=len(self._rate_limits[email]))
+            logger.warning("Email rate limit exceeded", 
+                          email=email, 
+                          count=len(self._rate_limits[email]),
+                          request_id=request_id,
+                          security_event=True)
+            self.security_manager.log_failed_attempt(email, "email_rate_limit_exceeded")
             return False
             
         self._rate_limits[email].append(now)
         return True
     
-    async def _send_email_request(self, data: Dict[str, str]) -> Dict[str, Any]:
-        """Send email request with retry logic."""
+    async def _send_email_request(self, data: Dict[str, str], request_id: Optional[str] = None) -> Dict[str, Any]:
+        """Send email request with retry logic and security tracking."""
         max_retries = 3
         retry_delay = 1
+        
+        start_time = datetime.now()
+        logger.debug("Starting mailgun API request", request_id=request_id, to_email=data.get('to'))
         
         for attempt in range(max_retries):
             try:
@@ -68,66 +76,110 @@ class MailgunClient:
                     response.raise_for_status()
                     result = response.json()
                     
+                    logger.info("Email sent successfully via Mailgun",
+                               to_email=data.get('to'),
+                               message_id=result.get('id'),
+                               request_id=request_id)
+                    
                     return {
                         'success': True,
                         'message_id': result.get('id'),
-                        'message': result.get('message', 'Email sent successfully')
+                        'message': result.get('message', 'Email sent successfully'),
+                        'request_id': request_id
                     }
                     
             except httpx.HTTPStatusError as e:
                 if e.response.status_code in [429, 503, 504] and attempt < max_retries - 1:
                     logger.warning(f"Retrying email send (attempt {attempt + 1})", 
-                                 status_code=e.response.status_code)
+                                 status_code=e.response.status_code,
+                                 request_id=request_id)
                     await asyncio.sleep(retry_delay * (2 ** attempt))
                     continue
                 else:
+                    error_msg = f"HTTP {e.response.status_code}: {str(e)}"
                     logger.error("HTTP error sending email", 
                                status_code=e.response.status_code,
-                               error=str(e))
+                               error=str(e),
+                               to_email=data.get('to'),
+                               request_id=request_id,
+                               security_event=True)
+                    self.security_manager.log_failed_attempt(data.get('to', 'unknown'), f"mailgun_http_error: {e.response.status_code}")
                     return {
                         'success': False,
-                        'error': f"HTTP {e.response.status_code}: {str(e)}"
+                        'error': error_msg,
+                        'request_id': request_id
                     }
             except Exception as e:
                 if attempt < max_retries - 1:
                     logger.warning(f"Retrying email send due to error (attempt {attempt + 1})", 
-                                 error=str(e))
+                                 error=str(e),
+                                 request_id=request_id)
                     await asyncio.sleep(retry_delay * (2 ** attempt))
                     continue
                 else:
-                    logger.error("Error sending email", error=str(e))
+                    logger.error("Error sending email", 
+                               error=str(e),
+                               to_email=data.get('to'),
+                               request_id=request_id,
+                               security_event=True)
+                    self.security_manager.log_failed_attempt(data.get('to', 'unknown'), f"mailgun_error: {str(e)}")
                     return {
                         'success': False,
-                        'error': str(e)
+                        'error': str(e),
+                        'request_id': request_id
                     }
         
-        return {'success': False, 'error': 'Max retries exceeded'}
+        return {
+            'success': False, 
+            'error': 'Max retries exceeded',
+            'request_id': request_id
+        }
     
     async def send_email(self, to_email: str, subject: str, content: str, 
-                        from_email: Optional[str] = None) -> Dict[str, Any]:
+                        from_email: Optional[str] = None, request_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Send a plain text email via Mailgun.
+        Send a plain text email via Mailgun with comprehensive security checks.
         
         Args:
             to_email: Recipient email address
             subject: Email subject
             content: Email content (plain text)
             from_email: Sender email (defaults to service email)
+            request_id: Optional request ID for tracking
             
         Returns:
             Dict with success status and message details
         """
-        # Validation
-        if not self._validate_email(to_email):
-            logger.error("Invalid email address", email=to_email)
-            return {'success': False, 'error': 'Invalid email address format'}
+        # Generate request ID if not provided
+        if not request_id:
+            request_id = self.security_manager.generate_request_id()
         
-        # Rate limiting
-        if not await self._check_rate_limit(to_email):
+        # Enhanced email validation using security module
+        if not self._validate_email_security(to_email):
+            logger.error("Email security validation failed", 
+                        email=to_email,
+                        request_id=request_id,
+                        security_event=True)
+            self.security_manager.log_failed_attempt(to_email, "email_validation_failed")
             return {
                 'success': False, 
-                'error': f'Rate limit exceeded. Max {self._max_emails_per_hour} emails per hour.'
+                'error': 'Email address failed security validation',
+                'request_id': request_id
             }
+        
+        # Rate limiting with security logging
+        if not await self._check_rate_limit(to_email, request_id):
+            return {
+                'success': False, 
+                'error': f'Rate limit exceeded. Max {self._max_emails_per_hour} emails per hour.',
+                'request_id': request_id
+            }
+        
+        # Content sanitization
+        if settings.content_sanitization_enabled:
+            from app.utils.security import sanitize_content
+            content = sanitize_content(content)
+            subject = sanitize_content(subject)
         
         sender = from_email or self.service_email
         
@@ -138,8 +190,11 @@ class MailgunClient:
             "text": content
         }
         
-        logger.info("Sending email via Mailgun", to=to_email, subject=subject)
-        return await self._send_email_request(data)
+        logger.info("Sending email via Mailgun", 
+                   to=to_email, 
+                   subject=subject,
+                   request_id=request_id)
+        return await self._send_email_request(data, request_id)
     
     async def send_ai_response_draft(self, to_email: str, original_subject: str, 
                                    ai_response: str, original_email_preview: str,
